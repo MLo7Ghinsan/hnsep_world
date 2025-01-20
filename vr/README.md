@@ -1,0 +1,1 @@
+download hnsep model from [here](https://github.com/yqzhishen/HarmonicNoiseSeparationGUI/releases/tag/model) and put it in this folder
