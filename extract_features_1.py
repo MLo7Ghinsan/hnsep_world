@@ -8,6 +8,17 @@ import parselmouth
 from parselmouth.praat import call
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram
+import urllib.request
+import pyworld as pw
+
+def ensure_model_file(model_path):
+    if os.path.exists(model_path):
+        return
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    url = "https://github.com/yqzhishen/HarmonicNoiseSeparationGUI/releases/download/model/hnsep_VR_44.1k_hop512_2024.05.onnx"
+    print(f"HNSEP model not found. Downloading from {url} ...")
+    urllib.request.urlretrieve(url, model_path)
+    print("Model downloaded to", model_path)
 
 input_audio_path = "test"
 model_path = "vr/hnsep_VR_44.1k_hop512_2024.05.onnx"
@@ -76,6 +87,24 @@ def visualize_f0_overlay_combined(audio_array, sr, f0_times, f0_values, output_p
     plt.savefig(output_png_path)
     plt.close()
 
+
+def save_world_sp(harmonic_int16, sr, f0_times, f0_values, out_npz_path, frame_period_ms=5.0):
+    if harmonic_int16.dtype.kind in ["i", "u"]:
+        x = harmonic_int16.astype(np.float64) / np.iinfo(harmonic_int16.dtype).max
+    else:
+        x = harmonic_int16.astype(np.float64)
+    frame_period_sec = frame_period_ms / 1000.0
+    total_time = len(x) / sr
+    n_frames = int(total_time / frame_period_sec) + 1
+    time_axis = np.arange(n_frames) * frame_period_sec
+
+    f0_interp = np.interp(time_axis, f0_times, f0_values)
+    f0_interp[np.isnan(f0_interp) | (f0_interp <= 0)] = 0.0
+
+    fft_size = pw.get_cheaptrick_fft_size(sr)
+    sp = pw.cheaptrick(x, f0_interp, time_axis, sr, fft_size=fft_size)
+    np.savez(out_npz_path, sp=sp, sr=sr, frame_period=frame_period_ms, fft_size=fft_size, n_frames=n_frames)
+    
 def process_audio_file(file_path, session):
     file_basename = os.path.basename(file_path)
     fname, _ = os.path.splitext(file_basename)
@@ -104,6 +133,10 @@ def process_audio_file(file_path, session):
         for time, f0 in zip(f0_times, f0_values):
             f.write(f"{time:.3f}\t{f0:.3f}\n")
 
+    # save WORLD spectral envelope so shifting script can skip extracting it
+    sp_npz_path = f"{output_folder_path}/{fname}_sp_world.npz"
+    save_world_sp(harmonic, sr, f0_times, f0_values, sp_npz_path, frame_period_ms=5.0)
+
     if save_png:
         f0_png_path = f"{output_folder_path}/{fname}_f0_overlay.png"
         combined_audio = (harmonic + noise).astype("float32") / 32768.0
@@ -117,6 +150,7 @@ def main():
     else:
         raise ValueError("Input path must be a .wav file or a folder containing .wav files.")
 
+    ensure_model_file(model_path)
     session = ort.InferenceSession(model_path)
 
     for file_path in input_files:
