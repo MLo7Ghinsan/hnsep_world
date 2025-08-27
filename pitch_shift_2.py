@@ -26,6 +26,24 @@ def interpolate_f0(f0_times, f0_values, target_times):
     f0_interpolated[np.isnan(f0_interpolated) | (f0_interpolated <= 0)] = 0.0
     return f0_interpolated
 
+
+def synth_from_sp(sp, sr, f0_times, f0_values, semitone_shift, frame_period_ms=5.0):
+    shift_factor = 2 ** (semitone_shift / 12.0)
+    n_frames = sp.shape[0]
+    frame_period_sec = frame_period_ms / 1000.0
+    time_axis = np.arange(n_frames) * frame_period_sec
+
+    f0_interp = np.interp(time_axis, f0_times, f0_values)
+    f0_interp[np.isnan(f0_interp) | (f0_interp <= 0)] = 0.0
+    modified_f0 = f0_interp * shift_factor
+
+    number_of_bins = sp.shape[1]
+    ap = np.ones((n_frames, number_of_bins))
+    ap[modified_f0 > 0.0, :] = 0.0
+
+    y = pw.synthesize(modified_f0, sp, ap, sr, frame_period=frame_period_ms)
+    return y
+
 def pitch_shift(harmonic_waveform, sr, f0_interpolated, shift_factor, frame_period):
     modified_f0 = f0_interpolated * shift_factor
 
@@ -55,23 +73,31 @@ def apply_fade(audio, sr, fade_duration=0.01):
         audio[-fade_samples:] *= fade_out
     return audio
 
+
 def process_files(harmonic_path, noise_path, f0_path, output_path_base, semitone_shift):
-    shift_factor = 2 ** (semitone_shift / 12.0)
-
-    harmonic_waveform, sr = sf.read(harmonic_path)
-    if harmonic_waveform.ndim > 1:
-        harmonic_waveform = harmonic_waveform.mean(axis=1)
-    if harmonic_waveform.dtype.kind in ["i", "u"]:
-        harmonic_waveform = harmonic_waveform.astype(np.float64) / np.iinfo(harmonic_waveform.dtype).max
-
+    base = os.path.splitext(harmonic_path)[0].replace("_harmonic","")
+    sp_npz_path = f"{base}_sp_world.npz"
     f0_times, f0_values = read_f0_file(f0_path)
-    frame_period_sec = frame_period / 1000.0
-    total_time = len(harmonic_waveform) / sr
-    number_of_frames = int(total_time / frame_period_sec) + 1
-    target_times = np.arange(number_of_frames) * frame_period_sec
-    f0_interpolated = interpolate_f0(f0_times, f0_values, target_times)
 
-    synthesized_waveform = pitch_shift(harmonic_waveform, sr, f0_interpolated, shift_factor, frame_period)
+    if os.path.exists(sp_npz_path):
+        data = np.load(sp_npz_path)
+        sp = data["sp"]
+        sr = int(data["sr"])
+        frame_period_ms = float(data.get("frame_period", 5.0))
+        y_harm = synth_from_sp(sp, sr, f0_times, f0_values, semitone_shift, frame_period_ms=frame_period_ms)
+    else:
+        harmonic_waveform, sr = sf.read(harmonic_path)
+        if harmonic_waveform.ndim > 1:
+            harmonic_waveform = harmonic_waveform.mean(axis=1)
+        if harmonic_waveform.dtype.kind in ["i", "u"]:
+            harmonic_waveform = harmonic_waveform.astype(np.float64) / np.iinfo(harmonic_waveform.dtype).max
+
+        frame_period_sec = frame_period / 1000.0
+        total_time = len(harmonic_waveform) / sr
+        number_of_frames = int(total_time / frame_period_sec) + 1
+        target_times = np.arange(number_of_frames) * frame_period_sec
+        f0_interpolated = interpolate_f0(f0_times, f0_values, target_times)
+        y_harm = pitch_shift(harmonic_waveform, sr, f0_interpolated, 2 ** (semitone_shift / 12.0), frame_period)
 
     noise_waveform, sr_noise = sf.read(noise_path)
     if noise_waveform.ndim > 1:
@@ -79,18 +105,18 @@ def process_files(harmonic_path, noise_path, f0_path, output_path_base, semitone
     if noise_waveform.dtype.kind in ["i", "u"]:
         noise_waveform = noise_waveform.astype(np.float64) / np.iinfo(noise_waveform.dtype).max
 
-    min_length = min(len(synthesized_waveform), len(noise_waveform))
-    synthesized_waveform = synthesized_waveform[:min_length]
+    min_length = min(len(y_harm), len(noise_waveform))
+    y_harm = y_harm[:min_length]
     noise_waveform = noise_waveform[:min_length]
 
-    combined_waveform = synthesized_waveform + noise_waveform
-    combined_waveform = apply_fade(combined_waveform, sr, fade_duration=0.01)
+    combined_waveform = y_harm + noise_waveform
+    combined_waveform = apply_fade(combined_waveform, sr if "sr" in locals() else int(sr_noise), fade_duration=0.01)
 
     shift_sign = "+" if semitone_shift > 0 else "-"
     output_path = f"{output_path_base}{shift_sign}{abs(semitone_shift)}.wav"
-
-    sf.write(output_path, combined_waveform, sr)
+    sf.write(output_path, combined_waveform, int(sr if "sr" in locals() else sr_noise))
     print(f"Pitch-shifted audio (shift {semitone_shift} semitones) saved to {output_path}")
+
 
 def main():
     if not os.path.exists(output_folder):
